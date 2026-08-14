@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+lrcgen — word-per-word .lrc sidecar generator for a local music library.
+
+Engine: faster-whisper (CTranslate2 Whisper) running locally on CUDA.
+Model:  Systran/faster-whisper-large-v3-turbo by default (downloads on first run
+        into ~/.cache/huggingface). Use --model large-v3 for maximum accuracy.
+
+Output formats
+--------------
+  --format simple    (default) one line per word:
+                         [00:12.34]word
+  --format enhanced  one line per lyric line, each word carries its own timestamp
+                     (karaoke style, supported by mpv, foobar2000, Musixmatch):
+                         [00:12.34]<00:12.34>word <00:12.62>word2
+
+By default every audio file is transcribed and its .lrc (re)written — existing
+.lrc files are NOT trusted. Use --skip-existing to leave them alone.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import site
+import sys
+import time
+from pathlib import Path
+
+# --- CUDA 12 runtime bootstrap -------------------------------------------
+# The system has CUDA 13 only; ctranslate2 needs CUDA 12 libs (libcublas.so.12,
+# libcudnn.so.9, libcudart.so.12). Those ship as pip wheels (nvidia-*-cu12) in
+# this venv's site-packages — expose them via LD_LIBRARY_PATH before ctranslate2
+# is imported.
+try:
+    _nv = Path(site.getsitepackages()[0]) / "nvidia"
+    _libdirs = [str(d) for d in _nv.glob("*/lib") if d.is_dir()] if _nv.is_dir() else []
+    if _libdirs:
+        _existing = os.environ.get("LD_LIBRARY_PATH", "")
+        os.environ["LD_LIBRARY_PATH"] = ":".join(_libdirs + ([_existing] if _existing else []))
+except Exception:
+    pass
+# -------------------------------------------------------------------------
+
+AUDIO_EXT = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".wma", ".mp4", ".m4b", ".aiff"}
+
+
+def fmt_lrc(seconds: float) -> str:
+    """seconds -> mm:ss.xx (LRC centisecond format)."""
+    if seconds < 0:
+        seconds = 0.0
+    m = int(seconds // 60)
+    s = seconds - m * 60
+    return f"{m:02d}:{s:05.2f}"
+
+
+def render_simple(words: list) -> str:
+    lines = []
+    for _seg, w in words:
+        text = w.word.strip()
+        if text:
+            lines.append(f"[{fmt_lrc(w.start)}]{text}")
+    return "\n".join(lines)
+
+
+def render_enhanced(groups: list) -> str:
+    """groups: list of (line_start, [word,...]) — one timestamped line per whisper segment."""
+    out = []
+    for line_start, words in groups:
+        if not words:
+            continue
+        parts = []
+        for w in words:
+            text = w.word.strip()
+            if text:
+                parts.append(f"<{fmt_lrc(w.start)}>{text}")
+        if parts:
+            out.append(f"[{fmt_lrc(line_start)}]{' '.join(parts)}")
+    return "\n".join(out)
+
+
+def build_groups(segments) -> list:
+    """Collect (segment, word) pairs and pre-group them by segment for enhanced mode."""
+    pairs, groups = [], []
+    for seg in segments:
+        seg_words = [w for w in (seg.words or []) if w.word and w.word.strip()]
+        if seg_words:
+            groups.append((seg.start, seg_words))
+        pairs.extend((seg, w) for w in seg_words)
+    return pairs, groups
+
+
+def drop_isolated(pairs: list, max_gap: float, min_run: int) -> list:
+    """Remove words that are not part of a contiguous lyric run.
+
+    Whisper hallucinates sparse filler words ('Thank you.', 'yeah') during
+    instrumental passages. Real lyrics cluster into dense runs (gap between
+    consecutive words << max_gap). Words belonging to runs shorter than
+    min_run are dropped. pairs must be sorted by word start.
+    """
+    if not pairs:
+        return pairs
+    # assign run ids: same run when gap to previous word <= max_gap
+    run_ids = [0]
+    for i in range(1, len(pairs)):
+        prev_end = pairs[i - 1][1].end
+        cur_start = pairs[i][1].start
+        run_ids.append(run_ids[-1] if cur_start - prev_end <= max_gap else run_ids[-1] + 1)
+    from collections import Counter
+    sizes = Counter(run_ids)
+    return [p for p, rid in zip(pairs, run_ids) if sizes[rid] >= min_run]
+
+
+GAP_SHIFT_STAMP = "# lrcgen-gap-align:v1"
+GAP_THRESHOLD_S = 2.0          # gap (start-to-start) that resets the lyric phrase
+GAP_SHIFTS = (0.45, 0.15, 0.05)  # measured whisper earliness for 1st/2nd/3rd word after a gap
+
+
+def apply_gap_shift(pairs: list, threshold: float = GAP_THRESHOLD_S,
+                    shifts: tuple = GAP_SHIFTS) -> bool:
+    """Delay words that follow a lyric pause.
+
+    Whisper's word timestamps run ~0.45s early for the first word after a
+    gap (measured against professionally-timed lyrics on 18 tracks: median
+    -0.44s for word 1, -0.14s for word 2, -0.06s for word 3; ~-0.1s for the
+    rest). This shifts the first three words after each gap by those amounts
+    so karaoke highlighting no longer jumps ahead of the sung word.
+
+    pairs: list of (segment, word) sorted by word start. Mutates word times
+    in place (monotonicity preserved). Returns True if anything shifted.
+    """
+    if not pairs:
+        return False
+    # compute per-word shift from ORIGINAL times
+    n = len(pairs)
+    phrase_pos = [0] * n
+    prev_start = None
+    for i, (_seg, w) in enumerate(pairs):
+        if prev_start is None or w.start - prev_start > threshold:
+            phrase_pos[i] = 1
+        else:
+            phrase_pos[i] = min(phrase_pos[i - 1] + 1, len(shifts) + 1)
+        prev_start = w.start
+    shift_sec = [shifts[p - 1] if 0 < p <= len(shifts) else 0.0 for p in phrase_pos]
+    if not any(shift_sec):
+        return False
+    # apply, preserving monotonic word-START order (karaoke lights words by start)
+    last_new_start = None
+    for i, (seg, w) in enumerate(pairs):
+        d = shift_sec[i]
+        if d > 0:
+            w.start += d
+            w.end += d
+        if last_new_start is not None and w.start < last_new_start:
+            w.start = last_new_start
+            w.end = max(w.end, w.start)
+        last_new_start = w.start
+    return True
+
+
+def metadata_header(path: Path) -> str:
+    """Best-effort [ti:]/[ar:]/[al:] header from embedded tags (mutagen)."""
+    try:
+        from mutagen import File as MFile
+        mf = MFile(path)
+        if mf is None:
+            return ""
+        def get(*keys):
+            for k in keys:
+                v = mf.get(k)
+                if v:
+                    return str(v[0] if isinstance(v, list) else v)
+            return ""
+        parts = []
+        for tag, keys in (("ti", ("title", "TIT2")), ("ar", ("artist", "TPE1")), ("al", ("album", "TALB"))):
+            val = get(*keys)
+            if val:
+                parts.append(f"[{tag}:{val}]")
+        return "\n".join(parts) + "\n" if parts else ""
+    except Exception:
+        return ""
+
+
+def collect_audio(paths: list[Path]) -> list[Path]:
+    files = []
+    for p in paths:
+        if p.is_dir():
+            files.extend(
+                f for f in sorted(p.rglob("*"))
+                if f.is_file() and f.suffix.lower() in AUDIO_EXT
+                and not f.name.startswith(".") and not any(part.startswith(".") for part in f.parts)
+            )
+        elif p.is_file() and p.suffix.lower() in AUDIO_EXT:
+            files.append(p)
+    # dedupe, keep order
+    seen, out = set(), []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="+", type=Path, help="audio file(s) and/or directories to process (recursive)")
+    ap.add_argument("--model", default="large-v3-turbo",
+                    help="faster-whisper model id or size (default: large-v3-turbo; try large-v3 for max accuracy)")
+    ap.add_argument("--device", default="cuda", help="cuda | cpu (default: cuda)")
+    ap.add_argument("--compute-type", default=None, help="float16 (default on cuda), int8_float16, int8 on cpu, ...")
+    ap.add_argument("--format", choices=["simple", "enhanced"], default="simple",
+                    help="lrc layout: word-per-line (simple) or karaoke inline timestamps (enhanced)")
+    ap.add_argument("--language", default=None, help="force language code (default: auto-detect per file)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip files that already have a .lrc (default: REGENERATE all — existing "
+                         ".lrc files are not assumed correct)")
+    ap.add_argument("--skip-from-log", type=Path, default=None,
+                    help="resume file: skip every path listed with an OK or SKIP result in this log")
+    ap.add_argument("--vad", action="store_true",
+                    help="enable Silero VAD speech filtering (default OFF: VAD suppresses vocals over music; "
+                         "use for podcasts/spoken audio)")
+    ap.add_argument("--min-word-prob", type=float, default=0.3,
+                    help="drop words with token probability below this (default 0.3; 0 disables). "
+                         "Suppresses whisper's hallucinated 'Thank you' fills on instrumentals")
+    ap.add_argument("--min-words", type=int, default=15,
+                    help="tracks with fewer surviving words than this are treated as instrumental and skipped")
+    ap.add_argument("--condition-on-previous-text", action="store_true",
+                    help="let whisper condition on previous segment text (default OFF; reduces repetition loops on music)")
+    ap.add_argument("--max-gap", type=float, default=4.0,
+                    help="gap (s) that separates lyric runs in the island-removal filter")
+    ap.add_argument("--min-run", type=int, default=2,
+                    help="drop runs shorter than this many words (isolated hallucinated fills)")
+    ap.add_argument("--keep-isolated", action="store_true",
+                    help="disable island-removal (keeps every word that passes the probability filter)")
+    ap.add_argument("--no-gap-shift", action="store_true",
+                    help="disable the lyric-gap timing correction (whisper is ~0.45s early "
+                         "for the first word after a pause)")
+    ap.add_argument("--beam-size", type=int, default=5)
+    ap.add_argument("--dry-run", action="store_true", help="only list files that would be processed")
+    ap.add_argument("--log-file", type=Path, default=None, help="append progress lines to this file")
+    args = ap.parse_args()
+
+    if args.compute_type is None:
+        # int8_float16: weights in int8 (≈0.8 GB for turbo) — far less likely to OOM
+        # when the desktop/games share the GPU; quality loss vs float16 is negligible.
+        args.compute_type = "int8_float16" if args.device == "cuda" else "int8"
+
+    files = collect_audio(args.paths)
+    done_from_log = set()
+    if args.skip_from_log is not None:
+        try:
+            for line in args.skip_from_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0] in ("OK", "SKIP"):
+                    done_from_log.add(parts[1])
+            print(f"resume log: {len(done_from_log)} already-done tracks will be skipped")
+        except FileNotFoundError:
+            print(f"warning: resume log {args.skip_from_log} not found; processing everything")
+
+    todo = []
+    for f in files:
+        lrc = f.with_suffix(".lrc")
+        if lrc.exists() and args.skip_existing:
+            continue
+        if str(f) in done_from_log:
+            continue
+        todo.append(f)
+
+    skipped_reason = "already in resume log" if args.skip_from_log else "already have .lrc and --skip-existing"
+    print(f"found {len(files)} audio file(s); {len(todo)} to (re)generate "
+          f"({len(files) - len(todo)} skipped: {skipped_reason})")
+    if args.dry_run:
+        for f in todo:
+            print("  would process:", f)
+        return 0
+    if not todo:
+        return 0
+
+    import gc
+    from faster_whisper import WhisperModel
+
+    def load_model():
+        t_load = time.time()
+        print(f"loading model '{args.model}' on {args.device} ({args.compute_type}) ...", flush=True)
+        m = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+        print(f"model ready in {time.time() - t_load:.1f}s", flush=True)
+        return m
+
+    model = load_model()
+
+    def transcribe_with_retry(path):
+        """Transcribe with self-healing: GPU hiccups (OOM, device loss while the
+        desktop/games share VRAM) are recovered by reloading the model, up to 3 tries."""
+        nonlocal model
+        for attempt in range(1, 4):
+            try:
+                # transcribe() returns a lazy generator: force iteration inside the
+                # retry scope so word-timestamp errors surface here, not in main().
+                segments, info = model.transcribe(
+                    str(path),
+                    language=args.language,
+                    beam_size=args.beam_size,
+                    word_timestamps=True,
+                    vad_filter=args.vad,
+                    condition_on_previous_text=args.condition_on_previous_text,
+                )
+                segs = list(segments)
+                return segs, info
+            except Exception as e:
+                msg = str(e).lower()
+                is_gpu = any(k in msg for k in ("cuda", "out of memory", "invalid device", "cublas", "cudnn", "driver"))
+                if is_gpu and attempt < 3:
+                    print(f"  RECOVER: GPU error ({e}); reloading model, retry {attempt}/3", flush=True)
+                    del model
+                    gc.collect()
+                    time.sleep(3)
+                    model = load_model()
+                    continue
+                if attempt == 1 and "boolean index" in msg:
+                    # known faster-whisper word-timestamp bug (empty segment); retry once via VAD path
+                    print(f"  RECOVER: alignment bug ({e}); retrying with VAD path", flush=True)
+                    segments2, info2 = model.transcribe(
+                        str(path), language=args.language, beam_size=args.beam_size,
+                        word_timestamps=True, vad_filter=True,
+                        condition_on_previous_text=args.condition_on_previous_text,
+                    )
+                    return list(segments2), info2
+                raise
+        raise RuntimeError("unreachable")
+
+    logf = open(args.log_file, "a", buffering=1) if args.log_file else None
+    total_wall = time.time()
+    done = skipped = failed = 0
+    for f in todo:
+        lrc = f.with_suffix(".lrc")
+        t0 = time.time()
+        try:
+            segments, info = transcribe_with_retry(f)
+            pairs, groups = build_groups(segments)
+            if args.min_word_prob > 0:
+                pairs = [(s, w) for s, w in pairs if w.probability >= args.min_word_prob]
+                groups = [(s, [w for w in ws if w.probability >= args.min_word_prob]) for s, ws in groups]
+                groups = [(s, ws) for s, ws in groups if ws]
+            if not args.keep_isolated:
+                pairs = drop_isolated(pairs, args.max_gap, args.min_run)
+                # rebuild segment groups from the surviving words so enhanced
+                # mode benefits from island removal too
+                groups = []
+                for seg, w in pairs:
+                    if groups and groups[-1][0] is seg:
+                        groups[-1][1].append(w)
+                    else:
+                        groups.append([seg, [w]])
+                groups = [(seg.start, words) for seg, words in groups]
+            if not args.no_gap_shift:
+                shifted = apply_gap_shift(pairs)
+                # re-anchor groups on the (possibly shifted) first word and
+                # refresh line starts so the pane doesn't switch lines early
+                groups = []
+                for seg, w in pairs:
+                    if groups and groups[-1][0] is seg:
+                        groups[-1][1].append(w)
+                    else:
+                        groups.append([seg, [w]])
+                groups = [(words[0].start if words else seg.start, words) for seg, words in groups]
+            if not pairs or len(pairs) < args.min_words:
+                print(f"  SKIP (only {len(pairs)} words survive probability filter, likely instrumental): {f}")
+                skipped += 1
+                if logf:
+                    logf.write(f"SKIP\t{f}\t{len(pairs)} words\n")
+                continue
+            body = render_simple(pairs) if args.format == "simple" else render_enhanced(groups)
+            header = metadata_header(f)
+            if not args.no_gap_shift:
+                header += GAP_SHIFT_STAMP + "\n"
+            content = header + body + "\n"
+            lrc.write_text(content, encoding="utf-8")
+            dt = time.time() - t0
+            speed = info.duration / dt if dt > 0 else 0
+            done += 1
+            line = (f"  OK  {f.name}  lang={info.language} conf={info.language_probability:.2f} "
+                    f"dur={info.duration:.0f}s words={len(pairs)} {dt:.1f}s ({speed:.1f}x realtime)")
+            print(line, flush=True)
+            if logf:
+                logf.write(f"OK\t{f}\t{info.language}\t{info.duration:.1f}\t{len(pairs)}\t{dt:.1f}\n")
+        except Exception as e:
+            failed += 1
+            msg = f"  FAIL {f}: {e}"
+            print(msg, flush=True)
+            if logf:
+                logf.write(f"FAIL\t{f}\t{e}\n")
+
+    total = time.time() - total_wall
+    print(f"\nfinished: {done} ok, {skipped} skipped (instrumental), {failed} failed, {total:.0f}s total")
+    if logf:
+        logf.write(f"SUMMARY\tok={done}\tskip={skipped}\tfail={failed}\tsecs={total:.0f}\n")
+        logf.close()
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# lrcgen launcher: picks the interpreter, then exposes any CUDA-12 pip-wheel
+# libs (nvidia-*-cu12) to the dynamic linker before running lrcgen.py.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Interpreter: LRCGEN_PYTHON env > repo .venv > python3 on PATH.
+PY="${LRCGEN_PYTHON:-}"
+if [ -z "$PY" ] && [ -x "$DIR/.venv/bin/python" ]; then PY="$DIR/.venv/bin/python"; fi
+if [ -z "$PY" ]; then PY="$(command -v python3 || true)"; fi
+if [ -z "$PY" ]; then
+  echo "no Python found — create a venv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+# CUDA-12 runtime libs from pip wheels (nvidia/cublas|cudnn|cuda_runtime/lib).
+for sp in "$(dirname "$(dirname "$PY")")"/lib/python*/site-packages; do
+  [ -d "$sp" ] || continue
+  for d in "$sp"/nvidia/*/lib; do
+    [ -d "$d" ] && export LD_LIBRARY_PATH="${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  done
+done
+
+exec "$PY" "$DIR/lrcgen.py" "$@"
