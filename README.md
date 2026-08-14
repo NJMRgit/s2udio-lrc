@@ -32,8 +32,9 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
 
 ## Requirements
 
-- Linux, an NVIDIA GPU (CUDA 12) — developed on an RTX 4080; CPU mode works
-  (`--device cpu`) but is much slower.
+- Linux; any NVIDIA GPU with CUDA 12 works — the model needs only ~1–2 GB of
+  VRAM in the default `int8_float16` mode (a 4 GB card is plenty). No GPU?
+  CPU mode works too (`--device cpu`) but is roughly 10–20× slower.
 - Python **3.12** (ctranslate2 — faster-whisper's engine — has no wheels for
   Python 3.14+ yet).
 - `ffmpeg`/`ffprobe` on PATH (used by the audio analysis).
@@ -88,8 +89,9 @@ rewritten. Use `--skip-existing` to leave existing files alone.
   (enhanced), one tab-separated line per track: `OK|SKIP|FAIL <path> …`.
 - Resume skips only tracks logged `OK`/`SKIP`; anything else (including
   crash-truncated `.lrc` files) is redone.
-- A typical 12k-track library runs in ~7–10 h on an RTX 4080
-  (~2–5 s/track, 50–120× realtime).
+- A typical 12k-track library runs in ~7–10 h on the development machine
+  (RTX 4080: ~2–5 s/track, 50–120× realtime); on weaker GPUs expect
+  proportionally longer, and CPU mode is ~10–20× slower again.
 
 ## Fixing timings on already-generated files
 
