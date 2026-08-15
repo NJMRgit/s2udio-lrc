@@ -1,6 +1,6 @@
 # s2udio-lrc — word-timed .lrc sidecars for a local music library
 
-Generate **word-per-word karaoke `.lrc` files** for your own music, fully
+Generate **word-per-word lyric `.lrc` files** for your own music, fully
 locally — a local Whisper model (via `faster-whisper`) transcribes and
 word-times every track on your GPU. No cloud, no uploads.
 
@@ -20,10 +20,6 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
   that have lyrics anywhere).
 - **Hallucination cleanup**: probability filter + "island removal" drop
   whisper's fake fill words (`Thank you.`, `yeah`) on instrumental breaks.
-- **Gap-timing correction** — the measured bias that makes karaoke
-  highlighting jump ahead right after a pause: whisper's word timestamps run
-  ~0.45s early for the first word after a lyric gap (0.15s / 0.05s for the
-  next two). `lrcgen` shifts those words so highlighting matches the audio.
 - **Crash-safe batch runs**: per-track tab-separated log, `--resume`
   re-processes only what failed or was interrupted.
 - **Self-healing**: GPU OOM / device-loss (games or desktop apps sharing the
