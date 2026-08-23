@@ -46,9 +46,18 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
 
 ## Requirements
 
-- Linux; any NVIDIA GPU with CUDA 12 works — the model needs only ~1–2 GB of
-  VRAM in the default `int8_float16` mode (a 4 GB card is plenty). No GPU?
-  CPU mode works too (`--device cpu`) but is roughly 10–20× slower.
+- Linux; any NVIDIA GPU with CUDA 12 works. VRAM depends on the pipeline
+  (measured peaks, desktop idle usage included):
+  | pipeline | peak VRAM |
+  |---|---|
+  | default (`large-v3-turbo`, `int8_float16`) | ~2 GB |
+  | `large-v3-turbo` + `--demucs` | ~11.5 GB |
+  | `large-v3` + `--demucs` (`int8_float16`) | ~12.6 GB |
+  | `large-v3` + `--demucs` (`float16`) | ~14.5 GB |
+
+  So the max-accuracy pipeline wants a **12–16 GB card**; smaller cards
+  should stay near the default pipeline (a 4–6 GB card runs the default fine).
+  No GPU? CPU mode works too (`--device cpu`) but is roughly 10–20× slower.
 - Python **3.12** (ctranslate2 — faster-whisper's engine — has no wheels for
   Python 3.14+ yet).
 - `ffmpeg`/`ffprobe` on PATH (used by the audio analysis).
@@ -135,6 +144,9 @@ getting in your way:
   then stays alive and re-scans each night — **newly added tracks get
   transcribed automatically** on the next window (replaced files too, via
   mtime tracking).
+- Peak VRAM is ~14.5 GB with these settings (`float16`) or ~12.6 GB with
+  `--compute-type int8_float16` (indistinguishable quality) — use a 16 GB
+  card, or trim the flags on smaller ones.
 - Single-instance lock; safe to autostart at boot. Example systemd user unit:
 
 ```ini
