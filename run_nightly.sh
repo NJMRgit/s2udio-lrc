@@ -32,16 +32,20 @@ remaining() {
 }
 
 while :; do
+  # rescanned every night: brand-new tracks are never in the resume log,
+  # so they show up here automatically
   left=$(remaining)
   if [ "${left:-1}" = "0" ]; then
-    echo "$(date '+%F %T') all tracks rebuilt with max-accuracy pipeline; exiting"
-    break
+    echo "$(date '+%F %T') library fully rebuilt; standing by for newly added tracks"
+  else
+    echo "$(date '+%F %T') $left track(s) remaining; next window starts at $(date -d @$(next_4am) '+%F %T')"
   fi
-  echo "$(date '+%F %T') $left track(s) remaining; next window starts at $(date -d @$(next_4am) '+%F %T')"
   sleep $(( $(next_4am) - $(date +%s) ))
 
   # clean any demucs temp dirs a hard stop may have left behind
   find "$LIB" -type d -name lrcgen-demucs -prune -exec rm -rf {} + 2>/dev/null
+
+  [ "$(remaining)" = "0" ] && continue   # nothing new; back to sleep
 
   dur=$(secs_to_10am)
   echo "$(date '+%F %T') window open: rebuilding for ${dur}s (resume from log)"
