@@ -51,6 +51,6 @@ while :; do
   echo "$(date '+%F %T') window open: rebuilding for ${dur}s (resume from log)"
   timeout --signal=TERM "$dur" \
     "$DIR/run_library.sh" --enhanced --resume \
-      --demucs --model large-v3 --compute-type float16
+      --demucs --fetch-lyrics --model large-v3 --compute-type float16
   echo "$(date '+%F %T') window closed (rc=$?)"
 done

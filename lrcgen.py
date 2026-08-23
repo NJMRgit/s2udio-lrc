@@ -192,6 +192,47 @@ def apply_gap_shift(pairs: list, threshold: float = GAP_THRESHOLD_S,
     return True
 
 
+def render_official(groups) -> str:
+    """groups: [(line_start, [(sec, word_str), ...])] -> enhanced LRC text."""
+    out = []
+    for start, wt in groups:
+        parts = [f"<{fmt_lrc(t)}>{w}" for t, w in wt]
+        out.append(f"[{fmt_lrc(start)}]{' '.join(parts)}")
+    return "\n".join(out)
+
+
+def try_official_lyrics(f: Path, duration: float, hyp_words):
+    """Fetch official lyrics and align them to whisper's words.
+
+    Returns enhanced-LRC body text, or None when no lyrics are found or the
+    alignment is too weak to trust (falls back to pure transcription).
+    """
+    import lyricsync
+    tags = lyricsync.read_tags(f)
+    if not tags.get("title") or not tags.get("artist"):
+        return None
+    rec = lyricsync.fetch_lrclib(tags["artist"], tags["title"],
+                                 tags.get("album"), duration)
+    if not rec or rec.get("instrumental"):
+        return None
+    synced_times = None
+    ref_lines = None
+    if rec.get("syncedLyrics"):
+        synced_times = lyricsync.parse_synced(rec["syncedLyrics"])
+        if synced_times:
+            ref_lines = [t for _, t in synced_times]
+    if ref_lines is None and rec.get("plainLyrics"):
+        ref_lines = lyricsync.split_lines(rec["plainLyrics"])
+    if not ref_lines:
+        return None
+    res = lyricsync.align(ref_lines, hyp_words, synced_times)
+    if res is None:
+        print("  official lyrics found but alignment too weak; transcribed text used", flush=True)
+        return None
+    groups, ratio = res
+    return render_official(groups), ratio, len(ref_lines)
+
+
 def metadata_header(path: Path) -> str:
     """Best-effort [ti:]/[ar:]/[al:] header from embedded tags (mutagen)."""
     try:
@@ -301,6 +342,10 @@ def main() -> int:
     ap.add_argument("--initial-prompt", default=None,
                     help="optional text prompt that biases transcription style, e.g. song "
                          "title/artist or a few real lyric lines (helps proper nouns and slang)")
+    ap.add_argument("--fetch-lyrics", action="store_true",
+                    help="look up official lyrics on LRCLIB (free, no key) and align them "
+                         "to whisper's timing instead of trusting the transcription — near-"
+                         "perfect word accuracy when the track is in the database")
     ap.add_argument("--demucs", action="store_true",
                     help="isolate vocals with demucs before transcribing (much better word "
                          "accuracy on busy mixes; adds GPU/CPU cost per track)")
@@ -449,6 +494,9 @@ def main() -> int:
             pairs = smart_filter(pairs, args.max_gap, args.min_run,
                                  iso_prob=(args.min_word_prob if args.min_word_prob > 0 else 0.0),
                                  run_prob=(args.run_min_word_prob if args.run_min_word_prob > 0 else 0.0))
+            official = None
+            if args.fetch_lyrics and args.format == "enhanced":
+                official = try_official_lyrics(f, info.duration, [w for _, w in pairs])
             # rebuild segment groups from the surviving words so enhanced
             # mode benefits from island removal too
             groups = []
@@ -475,10 +523,15 @@ def main() -> int:
                 if logf:
                     logf.write(f"SKIP\t{f}\t{len(pairs)} words\tmtime={f.stat().st_mtime:.6f}\n")
                 continue
-            body = render_simple(pairs) if args.format == "simple" else render_enhanced(groups)
-            header = metadata_header(f)
-            if not args.no_gap_shift:
-                header += GAP_SHIFT_STAMP + "\n"
+            if official is not None:
+                body, ratio, n_lines = official
+                body = body + f"\n# aligned {ratio*100:.0f}% of {n_lines} official lines"
+                header = metadata_header(f) + "# lrcgen-official-lyrics:v1\n"
+            else:
+                body = render_simple(pairs) if args.format == "simple" else render_enhanced(groups)
+                header = metadata_header(f)
+                if not args.no_gap_shift:
+                    header += GAP_SHIFT_STAMP + "\n"
             content = header + body + "\n"
             # atomic write: a kill mid-batch (nightly time window) must not
             # leave a truncated .lrc that players would show as broken lyrics
@@ -488,7 +541,9 @@ def main() -> int:
             dt = time.time() - t0
             speed = info.duration / dt if dt > 0 else 0
             done += 1
-            line = (f"  OK  {f.name}  lang={info.language} conf={info.language_probability:.2f} "
+            src_tag = "official" if official is not None else "transcribed"
+            line = (f"  OK  {f.name}  [{src_tag}] lang={info.language} "
+                    f"conf={info.language_probability:.2f} "
                     f"dur={info.duration:.0f}s words={len(pairs)} {dt:.1f}s ({speed:.1f}x realtime)")
             print(line, flush=True)
             if logf:

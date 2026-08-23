@@ -4,3 +4,4 @@ mutagen>=1.47
 
 # optional: vocal isolation for --demucs (big accuracy win on busy mixes)
 # demucs  # pulls in torch; install manually if you don't need it
+requests>=2.31
