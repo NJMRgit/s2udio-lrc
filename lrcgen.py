@@ -469,7 +469,11 @@ def main() -> int:
             if not args.no_gap_shift:
                 header += GAP_SHIFT_STAMP + "\n"
             content = header + body + "\n"
-            lrc.write_text(content, encoding="utf-8")
+            # atomic write: a kill mid-batch (nightly time window) must not
+            # leave a truncated .lrc that players would show as broken lyrics
+            tmp = lrc.with_suffix(".lrc.tmp")
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, lrc)
             dt = time.time() - t0
             speed = info.duration / dt if dt > 0 else 0
             done += 1
