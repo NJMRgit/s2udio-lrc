@@ -37,7 +37,9 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
   ~0.45s early for the first word after a lyric gap (0.15s / 0.05s for the
   next two). `lrcgen` shifts those words so highlighting matches the audio.
 - **Crash-safe batch runs**: per-track tab-separated log, `--resume`
-  re-processes only what failed or was interrupted.
+  re-processes only what failed or was interrupted; `.lrc` files are written
+  atomically so a kill mid-batch never leaves a truncated sidecar. Resume
+  matches on path **+ mtime**, so replaced/re-ripped files are redone.
 - **Self-healing**: GPU OOM / device-loss (games or desktop apps sharing the
   card) reloads the model and retries; a known faster-whisper
   "boolean index" word-timestamp bug retries via the VAD path.
@@ -117,6 +119,36 @@ rewritten. Use `--skip-existing` to leave existing files alone.
   `./run_library.sh --enhanced --demucs --model large-v3` (unknown flags
   are forwarded to lrcgen).
 
+## Hands-off nightly rebuild
+
+`run_nightly.sh` rebuilds an entire library at maximum accuracy without ever
+getting in your way:
+
+```bash
+./run_nightly.sh        # or run it under systemd/supervisor for autostart
+```
+
+- Runs only between **04:00 and 10:00** local time; sleeps outside the window.
+- Uses the max-accuracy pipeline: `--enhanced --resume --demucs --model
+  large-v3 --compute-type float16`.
+- Resumes from `library-enhanced.log` every night until nothing remains,
+  then stays alive and re-scans each night — **newly added tracks get
+  transcribed automatically** on the next window (replaced files too, via
+  mtime tracking).
+- Single-instance lock; safe to autostart at boot. Example systemd user unit:
+
+```ini
+[Unit]
+Description=s2udio-lrc nightly rebuild
+
+[Service]
+ExecStart=%h/scripts/lrcgen/run_nightly.sh
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
 ## Fixing timings on already-generated files
 
 Whisper's gap bias is corrected at generation time, but if you changed the
@@ -135,16 +167,23 @@ files in place (idempotent, stamped `# lrcgen-gap-align:v1`):
 |---|---|---|
 | `--model` | `large-v3-turbo` | Whisper size (`large-v3` = max accuracy, ~4× slower) |
 | `--format` | `simple` | `enhanced` = karaoke lines with inline word markers (recommended for s2udio) |
-| `--min-word-prob` | `0.3` | drop words below this token probability (hallucination filter) |
+| `--demucs` | off | isolate vocals with demucs before transcribing — biggest accuracy win on busy mixes |
+| `--demucs-model` | `htdemucs` | separation model used by `--demucs` |
+| `--min-word-prob` | `0.3` | confidence floor for **sparse** words outside lyric runs |
+| `--run-min-word-prob` | `0.05` | confidence floor for words **inside** dense lyric lines (kept low so mumbled-but-real words survive) |
+| `--no-speech-threshold` | `0.9` | whisper's segment-skip threshold; raised from whisper's 0.6 so sung lines over loud instrumentation aren't dropped (0 disables skipping) |
+| `--log-prob-threshold` | `-1.0` | whisper's average-logprob fallback threshold |
+| `--initial-prompt` | — | bias transcription style, e.g. title/artist or a few real lyric lines (helps proper nouns and slang) |
 | `--min-words` | `15` | tracks with fewer surviving words are skipped as instrumental |
-| `--keep-isolated` | off | disable island removal (keeps every word that passes the probability filter) |
+| `--keep-isolated` | off | disable island removal (keeps every confident isolated word) |
 | `--max-gap` / `--min-run` | `4.0` / `2` | island-removal knobs: words in runs shorter than `min-run`, gapped by >`max-gap`s, are dropped |
 | `--no-gap-shift` | off | disable the pause-timing correction |
 | `--vad` | off | Silero VAD filtering — for podcasts/spoken audio; **off by default** because it suppresses vocals over music |
 | `--skip-existing` | off | keep existing `.lrc` files instead of regenerating |
-| `--skip-from-log FILE` | — | resume: skip only tracks logged `OK`/`SKIP` in FILE |
+| `--skip-from-log FILE` | — | resume: skip tracks logged `OK`/`SKIP` in FILE whose mtime is unchanged |
 | `--language` | auto | force a language code |
-| `--compute-type` | `int8_float16` (cuda) | half the VRAM of `float16`, negligible quality loss |
+| `--beam-size` | `5` | beam width for decoding |
+| `--compute-type` | `int8_float16` (cuda) | half the VRAM of `float16`, quality indistinguishable in tests |
 
 ## s2udio integration
 
