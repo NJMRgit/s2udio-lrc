@@ -7,6 +7,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="${LRCGEN_LIB:-/mnt/20TBHDD/Media/Music}"
 LOG="$DIR/library-enhanced.log"
 
+# single instance: reboot autostart must never stack on a manual run
+exec 9>"$DIR/.nightly.lock"
+flock -n 9 || { echo "another nightly rebuild is already running; exiting"; exit 0; }
+
 next_4am() {
   local now t4
   now=$(date +%s)
