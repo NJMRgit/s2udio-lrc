@@ -105,8 +105,9 @@ rewritten. Use `--skip-existing` to leave existing files alone.
   `LRCGEN_LIB=/path/to/music ./run_library.sh …`.
 - Progress is appended to `library.log` (simple) / `library-enhanced.log`
   (enhanced), one tab-separated line per track: `OK|SKIP|FAIL <path> …`.
-- Resume skips only tracks logged `OK`/`SKIP`; anything else (including
-  crash-truncated `.lrc` files) is redone.
+- Resume skips only tracks logged `OK`/`SKIP` **whose file mtime is
+  unchanged** — a replaced or re-ripped file (same path, different audio)
+  no longer matches its old log entry and gets re-transcribed.
 - A typical 12k-track library runs in ~7–10 h on the development machine
   (RTX 4080: ~2–5 s/track, 50–120× realtime); on weaker GPUs expect
   proportionally longer, and CPU mode is ~10–20× slower again.

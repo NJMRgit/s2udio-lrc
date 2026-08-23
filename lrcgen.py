@@ -330,23 +330,34 @@ def main() -> int:
         args.compute_type = "int8_float16" if args.device == "cuda" else "int8"
 
     files = collect_audio(args.paths)
-    done_from_log = set()
+    # resume tracking is path + mtime: a replaced/re-ripped file (same path,
+    # different audio) no longer matches its old log entry and gets redone
+    done_from_log = {}
     if args.skip_from_log is not None:
         try:
             for line in args.skip_from_log.read_text(encoding="utf-8", errors="replace").splitlines():
                 parts = line.split("\t")
                 if len(parts) >= 2 and parts[0] in ("OK", "SKIP"):
-                    done_from_log.add(parts[1])
-            print(f"resume log: {len(done_from_log)} already-done tracks will be skipped")
+                    mt = next((float(p[6:]) for p in parts if p.startswith("mtime=")), None)
+                    done_from_log.setdefault(parts[1], []).append(mt)
+            print(f"resume log: {sum(len(v) for v in done_from_log.values())} "
+                  f"already-done tracks will be skipped (path+mtime matched)")
         except FileNotFoundError:
             print(f"warning: resume log {args.skip_from_log} not found; processing everything")
+
+    def is_done(f: Path) -> bool:
+        entries = done_from_log.get(str(f))
+        if not entries:
+            return False
+        cur = f.stat().st_mtime
+        return any(m is None or abs(cur - m) < 0.001 for m in entries)
 
     todo = []
     for f in files:
         lrc = f.with_suffix(".lrc")
         if lrc.exists() and args.skip_existing:
             continue
-        if str(f) in done_from_log:
+        if is_done(f):
             continue
         todo.append(f)
 
@@ -462,7 +473,7 @@ def main() -> int:
                 print(f"  SKIP (only {len(pairs)} words survive probability filter, likely instrumental): {f}")
                 skipped += 1
                 if logf:
-                    logf.write(f"SKIP\t{f}\t{len(pairs)} words\n")
+                    logf.write(f"SKIP\t{f}\t{len(pairs)} words\tmtime={f.stat().st_mtime:.6f}\n")
                 continue
             body = render_simple(pairs) if args.format == "simple" else render_enhanced(groups)
             header = metadata_header(f)
@@ -481,7 +492,8 @@ def main() -> int:
                     f"dur={info.duration:.0f}s words={len(pairs)} {dt:.1f}s ({speed:.1f}x realtime)")
             print(line, flush=True)
             if logf:
-                logf.write(f"OK\t{f}\t{info.language}\t{info.duration:.1f}\t{len(pairs)}\t{dt:.1f}\n")
+                logf.write(f"OK\t{f}\t{info.language}\t{info.duration:.1f}\t{len(pairs)}\t{dt:.1f}"
+                           f"\tmtime={f.stat().st_mtime:.6f}\n")
         except Exception as e:
             failed += 1
             msg = f"  FAIL {f}: {e}"
