@@ -89,6 +89,16 @@ def build_groups(segments) -> list:
     return pairs, groups
 
 
+def _run_ids(pairs: list, max_gap: float) -> list:
+    """Parallel list of lyric-run ids: same id when gap to the previous word
+    is <= max_gap. pairs must be sorted by word start."""
+    ids = [0] if pairs else []
+    for i in range(1, len(pairs)):
+        gap = pairs[i][1].start - pairs[i - 1][1].end
+        ids.append(ids[-1] if gap <= max_gap else ids[-1] + 1)
+    return ids
+
+
 def drop_isolated(pairs: list, max_gap: float, min_run: int) -> list:
     """Remove words that are not part of a contiguous lyric run.
 
@@ -99,15 +109,40 @@ def drop_isolated(pairs: list, max_gap: float, min_run: int) -> list:
     """
     if not pairs:
         return pairs
-    # assign run ids: same run when gap to previous word <= max_gap
-    run_ids = [0]
-    for i in range(1, len(pairs)):
-        prev_end = pairs[i - 1][1].end
-        cur_start = pairs[i][1].start
-        run_ids.append(run_ids[-1] if cur_start - prev_end <= max_gap else run_ids[-1] + 1)
     from collections import Counter
-    sizes = Counter(run_ids)
-    return [p for p, rid in zip(pairs, run_ids) if sizes[rid] >= min_run]
+    sizes = Counter(_run_ids(pairs, max_gap))
+    return [p for p, rid in zip(pairs, _run_ids(pairs, max_gap)) if sizes[rid] >= min_run]
+
+
+def smart_filter(pairs: list, max_gap: float, min_run: int,
+                 iso_prob: float, run_prob: float) -> list:
+    """Confidence filter that does NOT punch holes in real lyric lines.
+
+    The old behavior dropped every word below iso_prob globally — including
+    mumbled-but-real sung words in the middle of dense lines. Instead:
+
+      1. Compute lyric "runs" over ALL words (dense clusters whose word gaps
+         stay under max_gap). Runs shorter than min_run are whisper's isolated
+         hallucinated fills ('Thank you.', 'yeah').
+      2. Words inside dense runs survive unless probability < run_prob
+         (default 0.05 — near-junk only).
+      3. Sparse words survive only if confident (probability >= iso_prob).
+
+    Kills hallucinated fills while keeping low-confidence REAL words inside
+    lyric phrases. pairs must be sorted by word start.
+    """
+    if not pairs:
+        return pairs
+    from collections import Counter
+    ids = _run_ids(pairs, max_gap)
+    sizes = Counter(ids)
+    kept = []
+    for pair, rid in zip(pairs, ids):
+        w = pair[1]
+        threshold = run_prob if sizes[rid] >= min_run else iso_prob
+        if w.probability >= threshold:
+            kept.append(pair)
+    return kept
 
 
 GAP_SHIFT_STAMP = "# lrcgen-gap-align:v1"
@@ -180,6 +215,36 @@ def metadata_header(path: Path) -> str:
         return ""
 
 
+def separate_vocals(path: Path, workdir: Path, model_name: str) -> Path:
+    """Isolate vocals with demucs so whisper hears lyrics, not the full mix.
+
+    Returns the vocal stem path on the SAME timeline as the original audio
+    (word timestamps remain valid for the sidecar .lrc).
+    """
+    import subprocess
+    import shutil
+    out_root = workdir / "lrcgen-demucs"
+    out_root.mkdir(parents=True, exist_ok=True)
+    import shutil as _sh
+    demucs_bin = _sh.which("demucs") or str(Path(sys.executable).parent / "demucs")
+    cmd = [demucs_bin, "-n", model_name, "--two-stems=vocals", "-o", str(out_root), str(path)]
+    # torch must not see this venv's pip-wheel CUDA/cuDNN libs (exported for
+    # ctranslate2): mixed cuDNN sublibrary versions crash conv1d. Point it at
+    # the consistent system CUDA libraries instead.
+    env = {k: v for k, v in os.environ.items()}
+    env["LD_LIBRARY_PATH"] = "/usr/lib"
+    print("  demucs: separating vocals ...", flush=True)
+    t0 = time.time()
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"demucs failed: {r.stderr.strip()[-400:]}")
+    stems = list(out_root.rglob("vocals.wav"))
+    if not stems:
+        raise RuntimeError("demucs produced no vocals.wav")
+    print(f"  demucs: done in {time.time() - t0:.0f}s", flush=True)
+    return stems[0]
+
+
 def collect_audio(paths: list[Path]) -> list[Path]:
     files = []
     for p in paths:
@@ -219,8 +284,28 @@ def main() -> int:
                     help="enable Silero VAD speech filtering (default OFF: VAD suppresses vocals over music; "
                          "use for podcasts/spoken audio)")
     ap.add_argument("--min-word-prob", type=float, default=0.3,
-                    help="drop words with token probability below this (default 0.3; 0 disables). "
-                         "Suppresses whisper's hallucinated 'Thank you' fills on instrumentals")
+                    help="confidence floor for SPARSE words outside lyric runs "
+                         "(default 0.3; 0 disables). Words inside dense lyric runs are "
+                         "governed by --run-min-word-prob instead")
+    ap.add_argument("--run-min-word-prob", type=float, default=0.05,
+                    help="confidence floor for words INSIDE dense lyric runs "
+                         "(default 0.05). Low because mumbled-but-real sung words often "
+                         "score low; raising it removes more uncertain words")
+    ap.add_argument("--no-speech-threshold", type=float, default=0.9,
+                    help="whisper skips a segment when its no-speech probability exceeds "
+                         "this AND the segment logprob is poor. Whisper's default 0.6 drops "
+                         "real sung lines over loud instrumentation; music wants a high "
+                         "value (default 0.9). Pass 0 to disable segment skipping entirely")
+    ap.add_argument("--log-prob-threshold", type=float, default=-1.0,
+                    help="whisper's average-logprob fallback threshold (default -1.0)")
+    ap.add_argument("--initial-prompt", default=None,
+                    help="optional text prompt that biases transcription style, e.g. song "
+                         "title/artist or a few real lyric lines (helps proper nouns and slang)")
+    ap.add_argument("--demucs", action="store_true",
+                    help="isolate vocals with demucs before transcribing (much better word "
+                         "accuracy on busy mixes; adds GPU/CPU cost per track)")
+    ap.add_argument("--demucs-model", default="htdemucs",
+                    help="demucs model (default htdemucs)")
     ap.add_argument("--min-words", type=int, default=15,
                     help="tracks with fewer surviving words than this are treated as instrumental and skipped")
     ap.add_argument("--condition-on-previous-text", action="store_true",
@@ -287,7 +372,7 @@ def main() -> int:
 
     model = load_model()
 
-    def transcribe_with_retry(path):
+    def transcribe_with_retry(audio_path):
         """Transcribe with self-healing: GPU hiccups (OOM, device loss while the
         desktop/games share VRAM) are recovered by reloading the model, up to 3 tries."""
         nonlocal model
@@ -296,12 +381,16 @@ def main() -> int:
                 # transcribe() returns a lazy generator: force iteration inside the
                 # retry scope so word-timestamp errors surface here, not in main().
                 segments, info = model.transcribe(
-                    str(path),
+                    str(audio_path),
                     language=args.language,
                     beam_size=args.beam_size,
                     word_timestamps=True,
                     vad_filter=args.vad,
                     condition_on_previous_text=args.condition_on_previous_text,
+                    initial_prompt=args.initial_prompt,
+                    no_speech_threshold=(None if args.no_speech_threshold == 0
+                                         else args.no_speech_threshold),
+                    log_prob_threshold=args.log_prob_threshold,
                 )
                 segs = list(segments)
                 return segs, info
@@ -322,6 +411,10 @@ def main() -> int:
                         str(path), language=args.language, beam_size=args.beam_size,
                         word_timestamps=True, vad_filter=True,
                         condition_on_previous_text=args.condition_on_previous_text,
+                        initial_prompt=args.initial_prompt,
+                        no_speech_threshold=(None if args.no_speech_threshold == 0
+                                             else args.no_speech_threshold),
+                        log_prob_threshold=args.log_prob_threshold,
                     )
                     return list(segments2), info2
                 raise
@@ -333,24 +426,27 @@ def main() -> int:
     for f in todo:
         lrc = f.with_suffix(".lrc")
         t0 = time.time()
+        vocal_stem = None
         try:
-            segments, info = transcribe_with_retry(f)
-            pairs, groups = build_groups(segments)
-            if args.min_word_prob > 0:
-                pairs = [(s, w) for s, w in pairs if w.probability >= args.min_word_prob]
-                groups = [(s, [w for w in ws if w.probability >= args.min_word_prob]) for s, ws in groups]
-                groups = [(s, ws) for s, ws in groups if ws]
-            if not args.keep_isolated:
-                pairs = drop_isolated(pairs, args.max_gap, args.min_run)
-                # rebuild segment groups from the surviving words so enhanced
-                # mode benefits from island removal too
-                groups = []
-                for seg, w in pairs:
-                    if groups and groups[-1][0] is seg:
-                        groups[-1][1].append(w)
-                    else:
-                        groups.append([seg, [w]])
-                groups = [(seg.start, words) for seg, words in groups]
+            if args.demucs:
+                vocal_stem = separate_vocals(f, f.parent, args.demucs_model)
+            segments, info = transcribe_with_retry(vocal_stem or f)
+            pairs, _ = build_groups(segments)
+            # one confidence/island pass over ALL words: dense lyric runs keep
+            # even low-confidence (mumbled but real) words; sparse words must
+            # be confident and belong to a run of >= min_run words
+            pairs = smart_filter(pairs, args.max_gap, args.min_run,
+                                 iso_prob=(args.min_word_prob if args.min_word_prob > 0 else 0.0),
+                                 run_prob=(args.run_min_word_prob if args.run_min_word_prob > 0 else 0.0))
+            # rebuild segment groups from the surviving words so enhanced
+            # mode benefits from island removal too
+            groups = []
+            for seg, w in pairs:
+                if groups and groups[-1][0] is seg:
+                    groups[-1][1].append(w)
+                else:
+                    groups.append([seg, [w]])
+            groups = [(seg.start, words) for seg, words in groups]
             if not args.no_gap_shift:
                 shifted = apply_gap_shift(pairs)
                 # re-anchor groups on the (possibly shifted) first word and
@@ -388,6 +484,10 @@ def main() -> int:
             print(msg, flush=True)
             if logf:
                 logf.write(f"FAIL\t{f}\t{e}\n")
+        finally:
+            if vocal_stem is not None:
+                import shutil
+                shutil.rmtree(vocal_stem.parent.parent, ignore_errors=True)
 
     total = time.time() - total_wall
     print(f"\nfinished: {done} ok, {skipped} skipped (instrumental), {failed} failed, {total:.0f}s total")

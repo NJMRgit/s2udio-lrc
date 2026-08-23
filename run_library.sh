@@ -12,11 +12,13 @@ LIB="${LRCGEN_LIB:-/mnt/20TBHDD/Media/Music}"
 ENHANCED=0
 RESUME=0
 DRY=0
+EXTRA=()
 for arg in "$@"; do
   case "$arg" in
     --enhanced) ENHANCED=1 ;;
     --resume)   RESUME=1 ;;
     --dry-run)  DRY=1 ;;
+    *) EXTRA+=("$arg") ;;   # forwarded to lrcgen (--demucs, --model large-v3, ...)
   esac
 done
 
@@ -31,4 +33,4 @@ if [ "$RESUME" = 1 ] && [ -s "$LOG" ]; then
   echo "resume mode: skipping tracks already logged OK/SKIP in $LOG"
 fi
 
-exec "$DIR/lrcgen" "$LIB" --log-file "$LOG" "${ARGS[@]}"
+exec "$DIR/lrcgen" "$LIB" --log-file "$LOG" "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}

@@ -18,8 +18,20 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
 - **Instrumental detection** — tracks with no real vocals are skipped
   (verified against a 1,400+ track cross-check: zero false skips on tracks
   that have lyrics anywhere).
-- **Hallucination cleanup**: probability filter + "island removal" drop
-  whisper's fake fill words (`Thank you.`, `yeah`) on instrumental breaks.
+- **Vocal isolation (optional, recommended)** — `--demucs` separates the
+  vocals from the mix with demucs before transcribing, so whisper hears the
+  sung words instead of guitars and drums. Measured on a 4-track benchmark
+  (Bohemian Rhapsody / Bring Me to Life / Smells Like Teen Spirit / In the
+  End): missing words dropped ~40% and WER fell from 28.9% to 25.8%
+  (12.0% on Bohemian Rhapsody alone).
+- **Run-aware confidence filter** — low-confidence words are only dropped
+  when they are isolated; mumbled-but-real words inside dense lyric lines
+  are kept (the old global probability filter punched holes in real lines).
+- **Music-tuned decoding** — whisper's default `no_speech_threshold` (0.6)
+  silently drops whole sung lines over loud instrumentation; lrcgen raises
+  it (0.9) so those lines survive.
+- **Hallucination cleanup**: "island removal" still drops whisper's fake
+  fill words (`Thank you.`, `yeah`) on instrumental breaks.
 - **Gap-timing correction** — the measured bias that makes karaoke
   highlighting jump ahead right after a pause: whisper's word timestamps run
   ~0.45s early for the first word after a lyric gap (0.15s / 0.05s for the
@@ -44,6 +56,9 @@ which s2udio (and most karaoke players) highlight word-by-word in time.
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+
+# optional, for --demucs vocal isolation (pulls in torch):
+.venv/bin/pip install demucs
 ```
 
 The first run downloads the Whisper model (~1.6 GB for
@@ -65,6 +80,9 @@ automatically):
 
 # A whole directory (recursive), enhanced karaoke format
 ./lrcgen "/mnt/Music/Artist/Album" --format enhanced
+
+# Maximum word accuracy: isolate vocals first (needs `pip install demucs`)
+./lrcgen "/mnt/Music/Artist/Album" --format enhanced --demucs
 
 # Preview without transcribing
 ./lrcgen /path/to/music --dry-run
@@ -92,6 +110,11 @@ rewritten. Use `--skip-existing` to leave existing files alone.
 - A typical 12k-track library runs in ~7–10 h on the development machine
   (RTX 4080: ~2–5 s/track, 50–120× realtime); on weaker GPUs expect
   proportionally longer, and CPU mode is ~10–20× slower again.
+- `--demucs` adds a few seconds per track on GPU (vocal separation) and is
+  worth it for anything with a busy mix. `--model large-v3` is ~4× slower
+  than the turbo default; combine both for maximum word accuracy:
+  `./run_library.sh --enhanced --demucs --model large-v3` (unknown flags
+  are forwarded to lrcgen).
 
 ## Fixing timings on already-generated files
 

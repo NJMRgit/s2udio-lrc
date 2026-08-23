@@ -1,3 +1,6 @@
 # Python 3.12 required (ctranslate2 has no cp314 wheels)
 faster-whisper>=1.0
 mutagen>=1.47
+
+# optional: vocal isolation for --demucs (big accuracy win on busy mixes)
+# demucs  # pulls in torch; install manually if you don't need it
